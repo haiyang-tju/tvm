@@ -34,6 +34,10 @@
 namespace tvm {
 namespace runtime {
 
+namespace
+{
+	const int CPU_PINNED_DEVICE = 0xffff;
+}
 class CUDADeviceAPI final : public DeviceAPI {
  public:
   void SetDevice(TVMContext ctx) final {
@@ -112,11 +116,18 @@ class CUDADeviceAPI final : public DeviceAPI {
                        size_t nbytes,
                        size_t alignment,
                        TVMType type_hint) final {
-    CUDA_CALL(cudaSetDevice(ctx.device_id));
+    
+	
     CHECK_EQ(256 % alignment, 0U)
         << "CUDA space is aligned at 256 bytes";
     void *ret;
-    CUDA_CALL(cudaMalloc(&ret, nbytes));
+	if(ctx.device_id != CPU_PINNED_DEVICE) {
+        CUDA_CALL(cudaSetDevice(ctx.device_id));
+		CUDA_CALL(cudaMalloc(&ret, nbytes));
+	} else {
+		CUDA_CALL(cudaMallocHost(&ret, nbytes));
+	}
+    
     return ret;
   }
 
@@ -137,6 +148,23 @@ class CUDADeviceAPI final : public DeviceAPI {
     cudaStream_t cu_stream = static_cast<cudaStream_t>(stream);
     from = static_cast<const char*>(from) + from_offset;
     to = static_cast<char*>(to) + to_offset;
+	
+    if(ctx_from.device_id == CPU_PINNED_DEVICE) {
+      ctx_from.device_id = 0;
+      ctx_from.device_type = kDLCPU;
+	}
+	
+    if(ctx_to.device_id == CPU_PINNED_DEVICE) {
+      ctx_to.device_id = 0;
+      ctx_to.device_type = kDLCPU;
+	}
+
+    /* In case there is a copy from a pinned host mem to pinned host mem */
+    if(ctx_to.device_type == kDLCPU && ctx_from.device_type == kDLCPU) {
+      memcpy(to, from, size);
+      return;
+    }
+	
     if (ctx_from.device_type == kDLGPU && ctx_to.device_type == kDLGPU) {
       CUDA_CALL(cudaSetDevice(ctx_from.device_id));
       if (ctx_from.device_id == ctx_to.device_id) {
@@ -211,11 +239,7 @@ class CUDADeviceAPI final : public DeviceAPI {
                       size_t size,
                       cudaMemcpyKind kind,
                       cudaStream_t stream) {
-    if (stream != 0) {
-      CUDA_CALL(cudaMemcpyAsync(to, from, size, kind, stream));
-    } else {
-      CUDA_CALL(cudaMemcpy(to, from, size, kind));
-    }
+    CUDA_CALL(cudaMemcpyAsync(to, from, size, kind, stream));
   }
 };
 
