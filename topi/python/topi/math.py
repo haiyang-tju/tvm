@@ -110,6 +110,23 @@ def tanh(x):
 
 
 @tvm.te.tag_scope(tag=tag.ELEMWISE)
+def tan(x):
+    """Take tan of input x.
+
+    Parameters
+    ----------
+    x : tvm.te.Tensor
+        Input argument.
+
+    Returns
+    -------
+    y : tvm.te.Tensor
+        The result.
+    """
+    return te.compute(x.shape, lambda *i: te.tan(x(*i)))
+
+
+@tvm.te.tag_scope(tag=tag.ELEMWISE)
 def cos(x):
     """Take cos of input x.
 
@@ -467,3 +484,19 @@ def fast_exp(x):
         The result.
     """
     return cpp.fast_exp(x, x.dtype, tag.ELEMWISE)
+
+
+def fast_tanh(x):
+    """Take tanhonential of input x using fast_tanh implementation
+
+    Parameters
+    ----------
+    x : tvm.Tensor
+        Input argument.
+
+    Returns
+    -------
+    y : tvm.Tensor
+        The result.
+    """
+    return cpp.fast_tanh(x, x.dtype, tag.ELEMWISE)

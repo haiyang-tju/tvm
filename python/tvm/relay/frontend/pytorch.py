@@ -19,7 +19,7 @@
 # pylint: disable=import-outside-toplevel, simplifiable-if-expression, unnecessary-comprehension
 """PT: PyTorch frontend."""
 import itertools
-from packaging import version
+import logging
 
 import numpy as np
 
@@ -31,6 +31,9 @@ from .. import expr as _expr
 from .. import op as _op
 from .common import get_relay_op
 from .common import infer_shape as _infer_shape
+from .common import infer_value as _infer_value
+
+from . import qnn_torch
 
 __all__ = ["from_pytorch"]
 
@@ -146,6 +149,10 @@ def _zeros():
 def _relu():
     def _impl(inputs, input_types):
         data = inputs[0]
+        if input_types[0] == "quint8":
+            assert len(inputs) == 3, "Input quant param not found in op inputs"
+            input_zero_point = _expr.const(inputs[2], dtype="int32")
+            return qnn_torch.quantized_relu(data, input_zero_point)
         return _op.nn.relu(data)
     return _impl
 
@@ -154,9 +161,14 @@ def _adaptive_avg_2d():
         data = inputs[0]
         output_size = _infer_shape(inputs[1])
 
-        return _op.nn.adaptive_avg_pool2d(
-            data,
-            output_size=output_size)
+        def func(x):
+            return _op.nn.adaptive_avg_pool2d(x, output_size=output_size)
+
+        if input_types[0] == "quint8":
+            return qnn_torch.quantized_adaptive_avg_2d(data, func)
+
+        return func(data)
+
     return _impl
 
 def _adaptive_max_2d():
@@ -458,7 +470,10 @@ def _avg_pool2d():
         data = inputs[0]
 
         pool_size = _infer_shape(inputs[1])
-        strides = _infer_shape(inputs[2])
+        if inputs[2]:
+            strides = _infer_shape(inputs[2])
+        else:
+            strides = pool_size
         padding = _infer_shape(inputs[3])
 
         ceil_mode = int(inputs[4])
@@ -503,7 +518,18 @@ def _mean():
         else:
             exclude = False
 
-        return _op.mean(data, axis, keepdims, exclude)
+        def func(x):
+            return _op.mean(x, axis, keepdims, exclude)
+
+        if input_types[0] == "quint8":
+            assert len(inputs) == 6, "Input quant param not found in op inputs"
+            input_scale = _expr.const(inputs[4])
+            input_zero_point = _expr.const(inputs[5])
+            return qnn_torch.quantized_mean(data, input_scale,
+                                            input_zero_point, func)
+
+        return func(data)
+
     return _impl
 
 def _chunk():
@@ -614,6 +640,91 @@ def _sqrt():
         return _op.tensor.sqrt(data)
     return _impl
 
+def _floor():
+    def _impl(inputs, input_types):
+        data = inputs[0]
+        return _op.floor(data)
+    return _impl
+
+def _to():
+    def _impl(inputs, input_types):
+        data = inputs[0]
+        if inputs[3] in ["cpu", "cuda"]:
+            return data
+        # special handling for aten::to(data, 6, _, _, _) case
+        # 6 means dtype = float
+        # this happens when converting upsampling with scale factor
+        cast_func = {
+            6: float,
+            3: int,
+        }
+        cast_func_expr = {
+            6: lambda x: _op.cast(x, "float32"),
+            3: lambda x: _op.cast(x, "int32"),
+        }
+        if inputs[1] in cast_func and not isinstance(data, _expr.Expr):
+            return cast_func[inputs[1]](data)
+        elif inputs[1] in cast_func and isinstance(data, _expr.Expr):
+            return cast_func_expr[inputs[1]](data)
+        return data
+
+    return _impl
+
+def _upsample(method):
+    def _impl(inputs, input_types):
+        if isinstance(inputs[1], _expr.Var):
+            out_size = _infer_shape(inputs[1])
+        elif isinstance(inputs[1], list):
+            infer_res = [_infer_value(size, {}) for size in inputs[1]]
+            out_size = [np.asscalar(res.asnumpy().astype(np.int))
+                        for res in infer_res]
+
+        data = inputs[0]
+
+        if len(inputs) > 2:
+            align_corners = inputs[2]
+        else:
+            align_corners = False
+
+        if align_corners:
+            coord_trans = "align_corners"
+        else:
+            coord_trans = "half_pixel"
+
+        def func(x):
+            return _op.image.resize(x, out_size, "NCHW", method, coord_trans)
+
+        if input_types[0] == "quint8":
+            import torch
+            from packaging import version
+
+            # Torch version > 1.4 changed upsampling API
+            if version.parse(torch.__version__) > version.parse("1.4.0"):
+                num_inputs = 7
+            else:
+                num_inputs = 5
+
+            assert len(inputs) == num_inputs, "Input quant param not found in op inputs"
+
+            input_scale = _expr.const(inputs[-2])
+            input_zero_point = _expr.const(inputs[-1])
+            return qnn_torch.quantized_upsample(data, input_scale,
+                                                input_zero_point, func)
+        return func(data)
+
+    return _impl
+
+
+def _expand_as():
+    def _impl(inputs, input_types):
+        # TODO: maybe fix this
+        # This assumes expand_as can be removed because TVM has broadcast op
+        msg = "aten::expand_as(...) found, assume it is part of broadcast op"
+        logging.warning(msg)
+        return inputs[0]
+    return _impl
+
+
 # Helper functions for operator implementation
 
 def _convert_data_type(input_type):
@@ -686,7 +797,7 @@ _convert_map = {
     "aten::div_"                            : _elemwise("divide"),
     "aten::ones"                            : _ones(),
     "aten::zeros"                           : _zeros(),
-    "aten::to"                              : _identity(),
+    "aten::to"                              : _to(),
     "aten::unsqueeze"                       : _unsqueeze(),
     "aten::cat"                             : _concatenate(),
     "aten::slice"                           : _slice(),
@@ -729,15 +840,19 @@ _convert_map = {
     "aten::permute"                         : _transpose(),
     "aten::sum"                             : _reduce("sum"),
     "aten::prod"                            : _reduce("prod"),
-    "aten::sqrt"                            : _sqrt()
+    "aten::sqrt"                            : _sqrt(),
+    'aten::floor'                           : _floor(),
+    "aten::detach"                          : _identity(),
+    "aten::upsample_bilinear2d"             : _upsample("bilinear"),
+    "aten::upsample_nearest2d"              : _upsample("nearest_neighbor"),
+    "aten::expand_as"                       : _expand_as()
 }
 
 
 def _run_jit_passes(graph):
     """ The inline pass is necessary to unwrap prim::CallMethod """
     import torch
-    if version.parse(torch.__version__) >= version.parse("1.4.0"):
-        torch._C._jit_pass_inline(graph)
+    torch._C._jit_pass_inline(graph)
 
 
 def _is_int_seq(seq):
@@ -781,6 +896,7 @@ def _report_missing_conversion(op_names):
                  "prim::ListConstruct", "prim::ListUnpack",
                  "prim::TupleConstruct", "prim::TupleUnpack"]
     known_ops += list(_convert_map.keys())
+    known_ops += list(qnn_torch.convert_map.keys())
 
     missing = [op_name for op_name in op_names
                if op_name not in known_ops]
@@ -788,6 +904,20 @@ def _report_missing_conversion(op_names):
     if missing:
         msg = "The following operators are not implemented: {}".format(missing)
         raise NotImplementedError(msg)
+
+def _check_input_names(script_module, input_shapes):
+    """ Check the graph inputs match the inputs """
+    ir_inputs = get_graph_input_names(script_module)
+
+    for ir_input in ir_inputs:
+        if ir_input not in input_shapes:
+            msg = "Missing graph input {} in input_shapes".format(ir_input)
+            raise RuntimeError(msg)
+
+    for input_name in input_shapes:
+        if input_name not in ir_inputs:
+            msg = "Unused graph input {} in input_shapes".format(input_name)
+            logging.warning(msg)
 
 
 def _getattr_attr_name(node):
@@ -860,7 +990,7 @@ def _get_constant(node):
 
 def _get_operator_nodes(nodes):
     """ Returns torch IR nodes that need conversion to Relay """
-    ops = {}
+    ops = []
     # Traverse nodes and add to graph
     for node in nodes:
         if node.outputsSize() > 1:
@@ -869,7 +999,7 @@ def _get_operator_nodes(nodes):
             node_name = _get_output_name(node)
 
         if node.kind() != "prim::GetAttr":
-            ops[node_name] = node
+            ops.append((node_name, node))
 
     return ops
 
@@ -933,6 +1063,7 @@ def parse_params(graph, state_dict):
     getattr_nodes = graph.findAllNodes("prim::GetAttr", recurse=True)
     params = {}
     param_tensors = {}
+    packed_param_map = {}
     seen = set()
 
     for node in getattr_nodes:
@@ -945,19 +1076,23 @@ def parse_params(graph, state_dict):
             full_attr = _getattr_full_name(getattrs)
             full_attr_node_name = _get_output_name(getattrs[-1])
 
-            if full_attr in state_dict:
+            if full_attr.endswith("_packed_params"):  # for quantized models
+                err_msg = "parameter %s not found in state dict" % full_attr
+                assert full_attr in state_dict, err_msg
+                packed_param_map[full_attr_node_name] = full_attr
+            elif full_attr in state_dict:
                 torch_tensor = state_dict[full_attr]
                 tensor, var = _get_tensor_and_var(torch_tensor,
                                                   full_attr_node_name)
                 param_tensors[full_attr_node_name] = tensor
                 params[full_attr_node_name] = var
 
-    return params, param_tensors
+    return params, param_tensors, packed_param_map
 
 
 def parse_operators(operators, outputs, output_index_map, ret_name):
     """ Convert each Torch IR operators to Relay equivalent """
-    for node_name, op_node in operators.items():
+    for node_name, op_node in operators:
         operator = op_node.kind()
         inputs = _get_op_inputs(op_node, outputs, output_index_map)
 
@@ -985,8 +1120,7 @@ def parse_operators(operators, outputs, output_index_map, ret_name):
 
 def get_all_op_names(graph):
     """ Return all operator names in the input graph """
-    nodes = list(graph.nodes())
-    return set(node.kind() for node in nodes)
+    return set(node.kind() for node in graph.nodes())
 
 
 def get_graph_input_names(script_module):
@@ -997,7 +1131,7 @@ def get_graph_input_names(script_module):
     return ir_inputs[1:]  # remove self at the 0th arg
 
 
-def from_pytorch(script_module, input_shapes):
+def from_pytorch(script_module, input_shapes, custom_convert_map=None):
     """ Load PyTorch model in the form of a scripted PyTorch model and convert into relay.
     The companion parameters will be handled automatically.
 
@@ -1011,6 +1145,9 @@ def from_pytorch(script_module, input_shapes):
         Graph level input shape dictionary
         The keys should be the same one returned by get_graph_input_names(...) above
 
+    custom_convert_map: Dictionary of str to Relay op
+        A custom op conversion map in the same format as _convert_map above
+
     Returns
     -------
     mod : tvm.relay.Module
@@ -1021,21 +1158,36 @@ def from_pytorch(script_module, input_shapes):
     """
     graph = script_module.graph.copy()
     _run_jit_passes(graph)
+
+    if custom_convert_map:
+        _convert_map.update(custom_convert_map)
+
     op_names = get_all_op_names(graph)
     _report_missing_conversion(op_names)
+    _check_input_names(script_module, input_shapes)
 
     params = script_module.state_dict()
     input_vars = parse_inputs(graph.inputs(), input_shapes)
-    param_vars, tensors = parse_params(graph, params)
+    param_vars, tensors, packed_param_map = parse_params(graph, params)
+    tvm_params = {k: tvm.nd.array(v) for k, v in tensors.items()}
 
     input_vars.update(param_vars)
     outputs = list(input_vars.values())
     output_index_map = dict(zip(input_vars.keys(), range(len(outputs))))
     ret_name = _get_input_names(graph.return_node())[0]
 
+    # For quantized models
+    if "aten::quantize_per_tensor" in op_names:
+        weight_quant_params = qnn_torch.get_weight_quant_params(script_module)
+        qnn_torch.add_input_quant_params_to_op_inputs(graph)
+        qnn_torch.add_quant_params_to_outputs(outputs, output_index_map,
+                                              packed_param_map,
+                                              weight_quant_params)
+        qnn_torch.add_quant_params(tvm_params, weight_quant_params)
+        _convert_map.update(qnn_torch.convert_map)
+
     body = parse_operators(_get_operator_nodes(graph.nodes()), outputs,
                            output_index_map, ret_name)
     func = tvm.relay.Function(_analysis.free_vars(body), body)
-    tvm_params = {k: tvm.nd.array(v) for k, v in tensors.items()}
 
     return _module.IRModule.from_expr(func), tvm_params

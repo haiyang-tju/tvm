@@ -393,6 +393,22 @@ def log(x):
     """
     return call_pure_intrin(x.dtype, "log", x)
 
+def tan(x):
+    """Take tan of input x.
+
+    Parameters
+    ----------
+    x : PrimExpr
+        Input argument.
+
+    Returns
+    -------
+    y : PrimExpr
+        The result.
+    """
+    return call_pure_intrin(x.dtype, "tan", x)
+
+
 def cos(x):
     """Take cos of input x.
 
@@ -950,6 +966,7 @@ def comm_reducer(fcombine, fidentity, name="reduce"):
 
                 # there are two way to use this {0} reducer:
                 # mode 1, accept (expr, axis, where) to produce an Reduce Expr
+                # tvm.{0} represents tvm.te.{0} or tvm.tir.{0}.
                 B = te.compute((m,), lambda i: tvm.{0}(A[i, k], axis=k), name="B")
 
                 # mode 2, simply use it with multiple Exprs:

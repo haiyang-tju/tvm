@@ -877,6 +877,7 @@ def _fused_batch_norm():
     def _impl(inputs, attr, params):
         # Tensorflow: (data, gamma, beta, moving_mean, moving_variance)
         # Relay:       (data, gamma, beta, moving_mean, moving_varience)
+        assert len(inputs) == 5
         axis = 3
         need_cast = False
 
@@ -887,7 +888,14 @@ def _fused_batch_norm():
         if 'U' in attr:
             need_cast = True
             inputs[0] = _op.cast(inputs[0], dtype=attr['U'].name)
-
+        # Check if mean and variance are empty
+        # If so, replace them with Mean and Variance Ops
+        # For run-time calculation
+        moving_mean_shape = [int(n) for n in inputs[3].type_annotation.shape]
+        moving_variance_shape = [int(n) for n in inputs[4].type_annotation.shape]
+        if (moving_mean_shape[0] == 0 and moving_variance_shape[0] == 0):
+            inputs[3] = _op.mean(inputs[0], axis=axis, keepdims=False, exclude=True)
+            inputs[4] = _op.variance(inputs[0], axis=axis, keepdims=False, exclude=True)
         out = AttrCvt(op_name='batch_norm',
                       transforms={'scale_after_normalization':'scale',
                                   'variance_epsilon':'epsilon'},
@@ -1500,6 +1508,12 @@ def _add_n():
 # compatible operators that do NOT require any conversion.
 _identity_list = []
 
+# Operators that get pruned away when the complete graph is frozen.
+# These operators are not needed for inference.
+_freezed_graph_pruned_op_list = ['ReadVariableOp', 'ResourceGather', 'Variable',
+                                 'VariableV2', 'VarHandleOp', 'Assign', 'AssignVariableOp']
+
+
 # _convert_map defines maps of name to converter functor(callable)
 # for 1 to 1 mapping, use Renamer if nothing but name is different
 # use AttrCvt if attributes need to be converted
@@ -1558,6 +1572,7 @@ _convert_map = {
     'LessEqual'                         : _broadcast('less_equal'),
     'Log'                               : AttrCvt('log'),
     'Log1p'                             : _log1p(),
+    'Tan'                               : AttrCvt('tan'),
     'Cos'                               : AttrCvt('cos'),
     'Sin'                               : AttrCvt('sin'),
     'LogicalAnd'                        : _logical('logical_and'),
@@ -2187,6 +2202,11 @@ class GraphProto(object):
         missing_operators = self._parse_import_prerequisites(graph)
 
         if missing_operators:
+            freezed_ops = [op for op in missing_operators if op in _freezed_graph_pruned_op_list]
+            if freezed_ops:
+                raise Exception("Graph is not frozen. Provide a frozen graph. "
+                                "Found operators {}".format(freezed_ops))
+
             raise NotImplementedError( \
                 "The following operators are not implemented: {}".format(missing_operators))
 
